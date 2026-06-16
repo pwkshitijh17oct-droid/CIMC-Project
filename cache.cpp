@@ -6,7 +6,7 @@
 
 using namespace std;
 
-class LRUCache {
+class CacheShard {
 private:
     struct CacheNode {
         string key;
@@ -27,32 +27,43 @@ private:
 
     // CRITICAL_SECTION is the native Windows equivalent of a mutex.
     // It prevents multiple threads from executing code inside a block simultaneously.
-    CRITICAL_SECTION cache_lock;
+    CRITICAL_SECTION shard_lock;
 
 public:
-    LRUCache(size_t capacity) {
+    CacheShard(size_t capacity) {
         max_capacity = capacity;
-        InitializeCriticalSection(&cache_lock);
+        InitializeCriticalSection(&shard_lock);
+    }
+
+    // Default constructor so arrays of shards can be allocated
+    CacheShard() {
+        max_capacity = 10; // Fallback default capacity
+        InitializeCriticalSection(&shard_lock);
+    }
+
+    // A setter so the master class can configure each shard's size
+    void set_capacity(size_t capacity) {
+        max_capacity = capacity;
     }
 
     // Destructor: Clean up the lock from the OS memory when the cache is destroyed
-    ~LRUCache() {
-        DeleteCriticalSection(&cache_lock);
+    ~CacheShard() {
+        DeleteCriticalSection(&shard_lock);
     }
 
     string get(const string& key) {
 
         // EnterCriticalSection "locks" the door. 
         // Other threads will pause here until this thread calls LeaveCriticalSection.
-        EnterCriticalSection(&cache_lock);
+        EnterCriticalSection(&shard_lock);
 
         // Check if the key exists in our hash map
         auto map_iterator = cache_map.find(key);
         
         // (Cache Miss)
         if (map_iterator == cache_map.end()) {
+            LeaveCriticalSection(&shard_lock); // Unlock before returning!
             return "";
-            LeaveCriticalSection(&cache_lock); // Unlock before returning!
         }
 
         // (Cache Hit)
@@ -66,13 +77,13 @@ public:
         // splice() is an O(1) operation that shifts an existing node to a new position
         eviction_list.splice(eviction_list.begin(), eviction_list, list_iterator);
 
-        LeaveCriticalSection(&cache_lock); // Unlock before returning!
+        LeaveCriticalSection(&shard_lock); // Unlock before returning!
         return value;
     }
 
     void set(const string& key, const string& value) {
 
-        EnterCriticalSection(&cache_lock);
+        EnterCriticalSection(&shard_lock);
 
         // Checking if the key already exists
         auto map_iterator = cache_map.find(key);
@@ -83,7 +94,7 @@ public:
             
             // Moved it to the front (MRU)
             eviction_list.splice(eviction_list.begin(), eviction_list, list_iterator);
-            LeaveCriticalSection(&cache_lock); // Unlock
+            LeaveCriticalSection(&shard_lock); // Unlock
             return;
         }
 
@@ -103,29 +114,63 @@ public:
         // Mapped the key to the newly inserted front node
         cache_map[key] = eviction_list.begin();
 
-        LeaveCriticalSection(&cache_lock); // Unlock
+        LeaveCriticalSection(&shard_lock); // Unlock
+    }
+};
+
+class ShardedCache {
+private:
+    size_t num_shards;
+    CacheShard* shards;    // Dynamic array of isolated buckets
+    hash<string> hash_fn;  // Standard C++ string hashing engine
+
+    // Modulo arithmetic maps the hash value uniformly to a valid shard index
+    size_t get_shard_index(const string& key) {
+        return hash_fn(key) % num_shards;
+    }
+
+public:
+    ShardedCache(size_t shard_count, size_t capacity_per_shard) {
+        num_shards = shard_count;
+        shards = new CacheShard[num_shards]; // Allocates using default constructor
+        
+        // Distribute the capacity sizing to each bucket segment
+        for (size_t i = 0; i < num_shards; ++i) {
+            shards[i].set_capacity(capacity_per_shard);
+        }
+    }
+
+    ~ShardedCache() {
+        delete[] shards; // Free memory array when cache goes out of scope
+    }
+
+    // Intercepts the key, computes its shard route, and invokes that specific shard's get()
+    string get(const string& key) {
+        size_t index = get_shard_index(key);
+        return shards[index].get(key);
+    }
+
+    // Intercepts the key, computes its shard route, and invokes that specific shard's set()
+    void set(const string& key, const string& value) {
+        size_t index = get_shard_index(key);
+        shards[index].set(key, value);
     }
 };
 
 int main() {
-    // Create a cache that can only hold 2 items
-    LRUCache cache(2);
+    // Instantiate 4 independent shards. Each individual shard holds up to 2 items.
+    ShardedCache cache(4, 2);
 
-    cout << "--- Testing Cache Insertion ---" << endl;
+    cout << "--- Testing Sharded Cache Architecture ---" << endl;
     cache.set("user_1", "Alice");
     cache.set("user_2", "Bob");
 
     cout << "Fetching user_1: " << cache.get("user_1") << " (Expected: Alice)" << endl;
 
-    // This insertion should trigger an eviction because capacity is 2!
-    // Since we just fetched "user_1", "user_2" (Bob) is the Least Recently Used item.
-    cout << "\n--- Adding user_3 (Should evict user_2) ---" << endl;
+    cout << "\n--- Adding user_3 ---" << endl;
     cache.set("user_3", "Charlie");
 
-    // "user_2" should be gone (Cache Miss -> returns empty string)
-    cout << "Fetching user_2: " << cache.get("user_2") << " (Expected: [Empty String])" << endl;
-    
-    // "user_1" and "user_3" should still be there
+    cout << "Fetching user_2: " << cache.get("user_2") << endl;
     cout << "Fetching user_1: " << cache.get("user_1") << " (Expected: Alice)" << endl;
     cout << "Fetching user_3: " << cache.get("user_3") << " (Expected: Charlie)" << endl;
 
