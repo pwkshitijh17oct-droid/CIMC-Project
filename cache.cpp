@@ -4,6 +4,9 @@
 #include <string>
 #include <windows.h>
 #include <chrono>
+#include <winsock2.h>
+#pragma comment(lib, "ws2_32.lib") // Tells the compiler to link the Windows Network Library
+#include <sstream>
 
 using namespace std;
 
@@ -172,10 +175,10 @@ public:
 class ShardedCache {
 private:
     size_t num_shards;
-    CacheShard* shards;    // Dynamic array of isolated buckets
-    hash<string> hash_fn;  // Standard C++ string hashing engine
+    CacheShard* shards;    // Dynamic array of isolated buckets(shards)
+    hash<string> hash_fn;  // Standard C++ string hashing function
 
-    // Modulo arithmetic maps the hash value uniformly to a valid shard index
+    // Modulo maps the hash value uniformly to a valid shard index
     size_t get_shard_index(const string& key) {
         return hash_fn(key) % num_shards;
     }
@@ -223,24 +226,106 @@ DWORD WINAPI BackgroundCleanupWorker(LPVOID lpParam) {
     return 0;
 }
 
+string process_client_command(ShardedCache& cache, const string& raw_command) {
+    stringstream ss(raw_command);
+    string action, key, value;
+    int ttl = 0;
+
+    ss >> action; // Extracts the first word (GET or SET)
+
+    if (action == "SET") {
+        ss >> key >> value;
+        if (ss >> ttl) {
+            // If a TTL value was provided, pass it along
+            cache.set(key, value, ttl);
+        } else {
+            cache.set(key, value, 0);
+        }
+        return "OK\r\n";
+    } 
+    else if (action == "GET") {
+        ss >> key;
+        string result = cache.get(key);
+        if (result == "") {
+            return "(nil)\r\n"; // Standard Redis-style response for a cache miss
+        }
+        return result + "\r\n";
+    }
+
+    return "ERROR: Unknown Command\r\n";
+}
+
 int main() {
+    // 1. Initialize our 4-shard Cache
     ShardedCache cache(4, 2);
 
-    // CreateThread is a Windows API function that spins up our background worker loop
+    // 2. Start the Background TTL Cleanup Thread
     CreateThread(NULL, 0, BackgroundCleanupWorker, &cache, 0, NULL);
 
-    cout << "--- Testing Sharded Cache TTL Architecture ---" << endl;
-    
-    cache.set("user_1", "Alice", 0); // Lives forever
-    cache.set("user_2", "Bob", 2);   // Expires in 2 seconds!
+    // 3. Initialize Winsock Layer
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        cout << "Failed to initialize Winsock." << endl;
+        return 1;
+    }
 
-    cout << "Immediate fetch - user_2: " << cache.get("user_2") << " (Expected: Bob)" << endl;
+    // 4. Create the Listening Socket
+    SOCKET server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_socket == INVALID_SOCKET) {
+        cout << "Socket creation failed." << endl;
+        WSACleanup();
+        return 1;
+    }
 
-    cout << "\n[System] Pausing main thread for 3 seconds..." << endl;
-    Sleep(3000); // Wait 3000 milliseconds
+    // 5. Bind the socket to Port 8888
+    sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY; // Listen on any network interface (localhost)
+    server_addr.sin_port = htons(8888);       // Port number 8888
 
-    cout << "\nPost-sleep fetch - user_2: " << cache.get("user_2") << " (Expected: [Empty String])" << endl;
-    cout << "Post-sleep fetch - user_1: " << cache.get("user_1") << " (Expected: Alice)" << endl;
+    if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
+        cout << "Bind failed with error code: " << WSAGetLastError() << endl;
+        closesocket(server_socket);
+        WSACleanup();
+        return 1;
+    }
 
+    // 6. Start Listening for connections (Max queue length of 5)
+    listen(server_socket, 5);
+    cout << "🚀 Sharded Cache Server is live and listening on port 8888..." << endl;
+
+    // 7. The Infinite Server Loop
+    while (true) {
+        SOCKET client_socket = accept(server_socket, NULL, NULL);
+        if (client_socket == INVALID_SOCKET) continue;
+
+        cout << "[Server] Client connected!" << endl;
+
+        char buffer[1024];
+        int bytes_received = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
+        
+        if (bytes_received > 0) {
+            buffer[bytes_received] = '\0'; // Null-terminate the string
+            string client_msg(buffer);
+
+            // Clean up any trailing windows newlines (\r or \n) from terminal clients
+            while (!client_msg.empty() && (client_msg.back() == '\n' || client_msg.back() == '\r' || client_msg.back() == ' ')) {
+                client_msg.pop_back();
+            }
+
+            cout << "[Server] Received: " << client_msg << endl;
+
+            // Process command and send the response back across the socket
+            string response = process_client_command(cache, client_msg);
+            send(client_socket, response.c_str(), response.length(), 0);
+        }
+
+        closesocket(client_socket); // Disconnect client and wait for next request
+        cout << "[Server] Client disconnected." << endl;
+    }
+
+    // Cleanup (Unreachable code in infinite loop, but good practice to write)
+    closesocket(server_socket);
+    WSACleanup();
     return 0;
 }
