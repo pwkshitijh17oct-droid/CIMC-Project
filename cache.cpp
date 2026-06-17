@@ -3,6 +3,7 @@
 #include <list>
 #include <string>
 #include <windows.h>
+#include <chrono>
 
 using namespace std;
 
@@ -11,8 +12,18 @@ private:
     struct CacheNode {
         string key;
         string value;
+
+        chrono::steady_clock::time_point expiry_time; 
+        bool has_ttl; // True if this item expires, false if it lives forever
         
-        CacheNode(string k, string v) : key(k), value(v) {}
+        CacheNode(string k, string v, int ttl_seconds = 0) : key(k), value(v) {
+            if (ttl_seconds > 0) {
+                expiry_time = chrono::steady_clock::now() + chrono::seconds(ttl_seconds);
+                has_ttl = true;
+            } else {
+                has_ttl = false;
+            }
+        }
     };
 
     size_t max_capacity;
@@ -24,6 +35,11 @@ private:
 
     // The Hash Map: maps key to an iterator in the eviction_list.
     unordered_map<string, list<CacheNode>::iterator> cache_map;
+
+    bool is_expired(const CacheNode& node) {
+        if (!node.has_ttl) return false;
+        return chrono::steady_clock::now() > node.expiry_time;
+    }
 
     // CRITICAL_SECTION is the native Windows equivalent of a mutex.
     // It prevents multiple threads from executing code inside a block simultaneously.
@@ -69,6 +85,17 @@ public:
         // (Cache Hit)
         // map_iterator->second holds the list iterator (pointer to the node)
         auto list_iterator = map_iterator->second;
+
+        // --- PASSIVE EXPIRATION CHECK ---
+        if (is_expired(*list_iterator)) {
+            // Clean it out of memory immediately!
+            cache_map.erase(key);
+            eviction_list.erase(list_iterator);
+            
+            LeaveCriticalSection(&shard_lock); // Don't forget to unlock!
+            return ""; // Treat it as a cache miss
+        }
+        // --------------------------------
         
         // Extracting the data before we move things around
         string value = list_iterator->value;
@@ -81,7 +108,7 @@ public:
         return value;
     }
 
-    void set(const string& key, const string& value) {
+    void set(const string& key, const string& value, int ttl_seconds = 0) {
 
         EnterCriticalSection(&shard_lock);
 
@@ -91,6 +118,13 @@ public:
         if (map_iterator != cache_map.end()) {
             auto list_iterator = map_iterator->second;
             list_iterator->value = value; // Update the value
+
+            if (ttl_seconds > 0) {
+                list_iterator->expiry_time = chrono::steady_clock::now() + chrono::seconds(ttl_seconds);
+                list_iterator->has_ttl = true;
+            } else {
+                list_iterator->has_ttl = false;
+            }
             
             // Moved it to the front (MRU)
             eviction_list.splice(eviction_list.begin(), eviction_list, list_iterator);
@@ -109,12 +143,29 @@ public:
         }
 
         //Inserted the new item at the front of the list
-        eviction_list.push_front(CacheNode(key, value));
+        eviction_list.push_front(CacheNode(key, value, ttl_seconds));
         
         // Mapped the key to the newly inserted front node
         cache_map[key] = eviction_list.begin();
 
         LeaveCriticalSection(&shard_lock); // Unlock
+    }
+
+    void clean_expired_keys() {
+        EnterCriticalSection(&shard_lock);
+        
+        auto it = eviction_list.begin();
+        while (it != eviction_list.end()) {
+            if (is_expired(*it)) {
+                cache_map.erase(it->key);
+                it = eviction_list.erase(it); // erase returns the next valid iterator
+                cout << "[Background Shard Worker] Evicted expired key from memory." << endl;
+            } else {
+                ++it;
+            }
+        }
+        
+        LeaveCriticalSection(&shard_lock);
     }
 };
 
@@ -151,28 +202,45 @@ public:
     }
 
     // Intercepts the key, computes its shard route, and invokes that specific shard's set()
-    void set(const string& key, const string& value) {
+    void set(const string& key, const string& value, int ttl_seconds = 0) {
         size_t index = get_shard_index(key);
-        shards[index].set(key, value);
+        shards[index].set(key, value, ttl_seconds);
+    }
+
+    void clean_all_shards() {
+        for (size_t i = 0; i < num_shards; ++i) {
+            shards[i].clean_expired_keys();
+        }
     }
 };
 
+DWORD WINAPI BackgroundCleanupWorker(LPVOID lpParam) {
+    ShardedCache* cache = (ShardedCache*)lpParam;
+    while (true) {
+        Sleep(1000); 
+        cache->clean_all_shards();
+    }
+    return 0;
+}
+
 int main() {
-    // Instantiate 4 independent shards. Each individual shard holds up to 2 items.
     ShardedCache cache(4, 2);
 
-    cout << "--- Testing Sharded Cache Architecture ---" << endl;
-    cache.set("user_1", "Alice");
-    cache.set("user_2", "Bob");
+    // CreateThread is a Windows API function that spins up our background worker loop
+    CreateThread(NULL, 0, BackgroundCleanupWorker, &cache, 0, NULL);
 
-    cout << "Fetching user_1: " << cache.get("user_1") << " (Expected: Alice)" << endl;
+    cout << "--- Testing Sharded Cache TTL Architecture ---" << endl;
+    
+    cache.set("user_1", "Alice", 0); // Lives forever
+    cache.set("user_2", "Bob", 2);   // Expires in 2 seconds!
 
-    cout << "\n--- Adding user_3 ---" << endl;
-    cache.set("user_3", "Charlie");
+    cout << "Immediate fetch - user_2: " << cache.get("user_2") << " (Expected: Bob)" << endl;
 
-    cout << "Fetching user_2: " << cache.get("user_2") << endl;
-    cout << "Fetching user_1: " << cache.get("user_1") << " (Expected: Alice)" << endl;
-    cout << "Fetching user_3: " << cache.get("user_3") << " (Expected: Charlie)" << endl;
+    cout << "\n[System] Pausing main thread for 3 seconds..." << endl;
+    Sleep(3000); // Wait 3000 milliseconds
+
+    cout << "\nPost-sleep fetch - user_2: " << cache.get("user_2") << " (Expected: [Empty String])" << endl;
+    cout << "Post-sleep fetch - user_1: " << cache.get("user_1") << " (Expected: Alice)" << endl;
 
     return 0;
 }
