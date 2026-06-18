@@ -7,6 +7,7 @@
 #include <winsock2.h>
 #pragma comment(lib, "ws2_32.lib") // Tells the compiler to link the Windows Network Library
 #include <sstream>
+#include <fstream> // For reading and writing files on disk 
 
 using namespace std;
 
@@ -176,6 +177,11 @@ class ShardedCache {
 private:
     size_t num_shards;
     CacheShard* shards;    // Dynamic array of isolated buckets(shards)
+
+    // --- WAL SYSTEM VARIABLES ---
+    ofstream wal_file;
+    CRITICAL_SECTION wal_lock;
+    
     hash<string> hash_fn;  // Standard C++ string hashing function
 
     // Modulo maps the hash value uniformly to a valid shard index
@@ -190,11 +196,27 @@ public:
         
         // Distribute the capacity sizing to each bucket segment
         for (size_t i = 0; i < num_shards; ++i) {
-            shards[i].set_capacity(capacity_per_shard);
+            shards[i].set_capacity(capacity_per_shard); // Keeps your existing call
         }
+
+        // --- NEW WAL INITIALIZATION ---
+        // Initialize WAL file lock
+        InitializeCriticalSection(&wal_lock);
+        
+        // Open the log file in append mode
+        wal_file.open("cache.log", ios::app);
+
+        // Recover previous data on boot
+        recover_from_wal();
+        // ------------------------------
     }
 
     ~ShardedCache() {
+        // --- NEW WAL CLEANUP ---
+        if (wal_file.is_open()) wal_file.close();
+        DeleteCriticalSection(&wal_lock);
+        // -----------------------
+
         delete[] shards; // Free memory array when cache goes out of scope
     }
 
@@ -206,14 +228,46 @@ public:
 
     // Intercepts the key, computes its shard route, and invokes that specific shard's set()
     void set(const string& key, const string& value, int ttl_seconds = 0) {
+        // 1. Map to correct memory shard
         size_t index = get_shard_index(key);
         shards[index].set(key, value, ttl_seconds);
+
+        // 2. Append to Disk Log (Thread-Safe)
+        EnterCriticalSection(&wal_lock);
+        if (wal_file.is_open()) {
+            wal_file << "SET " << key << " " << value << " " << ttl_seconds << "\n";
+            wal_file.flush(); // Forces Windows to write it to disk instantly
+        }
+        LeaveCriticalSection(&wal_lock);
     }
 
     void clean_all_shards() {
         for (size_t i = 0; i < num_shards; ++i) {
             shards[i].clean_expired_keys();
         }
+    }
+
+    void recover_from_wal() {
+        ifstream read_file("cache.log");
+        if (!read_file.is_open()) return; // No previous log file exists yet
+
+        cout << "[WAL Recovery] Found existing cache.log file. Restoring state..." << endl;
+        
+        string action, key, value;
+        int ttl;
+        int commands_loaded = 0;
+
+        // Read the file line by line
+        while (read_file >> action >> key >> value >> ttl) {
+            if (action == "SET") {
+                size_t index = get_shard_index(key);
+                shards[index].set(key, value, ttl);
+                commands_loaded++;
+            }
+        }
+        
+        read_file.close();
+        cout << "[WAL Recovery] Success. Restored " << commands_loaded << " keys back into memory." << endl;
     }
 };
 
