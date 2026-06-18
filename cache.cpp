@@ -255,6 +255,44 @@ string process_client_command(ShardedCache& cache, const string& raw_command) {
     return "ERROR: Unknown Command\r\n";
 }
 
+// This structure wraps the data a worker thread needs to communicate with a client
+struct ThreadParam {
+    SOCKET client_socket;
+    ShardedCache* cache;
+};
+
+// The worker function executed by each independent client thread
+DWORD WINAPI ClientHandlerThread(LPVOID lpParam) {
+    ThreadParam* params = (ThreadParam*)lpParam;
+    SOCKET client_socket = params->client_socket;
+    ShardedCache* cache = params->cache;
+
+    char buffer[1024];
+    int bytes_received = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
+    
+    if (bytes_received > 0) {
+        buffer[bytes_received] = '\0';
+        string client_msg(buffer);
+
+        // Clean up trailing whitespace and newlines
+        while (!client_msg.empty() && (client_msg.back() == '\n' || client_msg.back() == '\r' || client_msg.back() == ' ')) {
+            client_msg.pop_back();
+        }
+
+        cout << "[Thread " << GetCurrentThreadId() << "] Received: " << client_msg << endl;
+
+        // Process and respond
+        string response = process_client_command(*cache, client_msg);
+        send(client_socket, response.c_str(), response.length(), 0);
+    }
+
+    closesocket(client_socket);
+    
+    // Clean up the dynamically allocated parameters memory to avoid leaks
+    delete params; 
+    return 0;
+}
+
 int main() {
     // 1. Initialize our 4-shard Cache
     ShardedCache cache(4, 2);
@@ -294,34 +332,31 @@ int main() {
     listen(server_socket, 5);
     cout << "🚀 Sharded Cache Server is live and listening on port 8888..." << endl;
 
-    // 7. The Infinite Server Loop
+    // 7. The Multi-Threaded Server Loop
     while (true) {
+        // Accept incoming client connection
         SOCKET client_socket = accept(server_socket, NULL, NULL);
         if (client_socket == INVALID_SOCKET) continue;
 
-        cout << "[Server] Client connected!" << endl;
+        cout << "[Master Server] Connection accepted. Dispatching to worker thread..." << endl;
 
-        char buffer[1024];
-        int bytes_received = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
-        
-        if (bytes_received > 0) {
-            buffer[bytes_received] = '\0'; // Null-terminate the string
-            string client_msg(buffer);
+        // Package up the socket and cache reference dynamically for the new thread
+        ThreadParam* params = new ThreadParam();
+        params->client_socket = client_socket;
+        params->cache = &cache;
 
-            // Clean up any trailing windows newlines (\r or \n) from terminal clients
-            while (!client_msg.empty() && (client_msg.back() == '\n' || client_msg.back() == '\r' || client_msg.back() == ' ')) {
-                client_msg.pop_back();
-            }
-
-            cout << "[Server] Received: " << client_msg << endl;
-
-            // Process command and send the response back across the socket
-            string response = process_client_command(cache, client_msg);
-            send(client_socket, response.c_str(), response.length(), 0);
+        // Fire and forget: Spin up an independent worker thread for this client
+        HANDLE hThread = CreateThread(NULL, 0, ClientHandlerThread, params, 0, NULL);
+        if (hThread != NULL) {
+            // Close the handle token right away so the OS cleans up thread resources 
+            // automatically when it finishes executing. The thread keeps running!
+            CloseHandle(hThread); 
+        } else {
+            // Safe fallback if the OS runs out of resources to spawn a thread
+            cout << "[Master Server] Error: Failed to create worker thread." << endl;
+            closesocket(client_socket);
+            delete params;
         }
-
-        closesocket(client_socket); // Disconnect client and wait for next request
-        cout << "[Server] Client disconnected." << endl;
     }
 
     // Cleanup (Unreachable code in infinite loop, but good practice to write)
