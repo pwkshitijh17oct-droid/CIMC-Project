@@ -8,6 +8,8 @@
 #pragma comment(lib, "ws2_32.lib") // Tells the compiler to link the Windows Network Library
 #include <sstream>
 #include <fstream> // For reading and writing files on disk 
+#include <cstdlib> // For rand() and srand()
+#include <ctime>   // For initializing random seed
 
 using namespace std;
 
@@ -18,9 +20,13 @@ private:
         string value;
 
         chrono::steady_clock::time_point expiry_time; 
-        bool has_ttl; // True if this item expires, false if it lives forever
+        bool has_ttl; 
         
+        // --- NEW APPROXIMATE LRU VARIABLE ---
+        chrono::steady_clock::time_point last_accessed; 
+
         CacheNode(string k, string v, int ttl_seconds = 0) : key(k), value(v) {
+            last_accessed = chrono::steady_clock::now(); // Set initial access time
             if (ttl_seconds > 0) {
                 expiry_time = chrono::steady_clock::now() + chrono::seconds(ttl_seconds);
                 has_ttl = true;
@@ -28,25 +34,25 @@ private:
                 has_ttl = false;
             }
         }
+
+        // Default constructor needed for map insertions
+        CacheNode() : key(""), value(""), has_ttl(false) {
+            last_accessed = chrono::steady_clock::now();
+        }
     };
 
     size_t max_capacity;
 
-    // used HashMap + Doubly Linked List to achieve O(1) get() and put() operations.
-
-    // The Doubly Linked List: Front is MRU, Back is LRU.
-    list<CacheNode> eviction_list;
-
-    // The Hash Map: maps key to an iterator in the eviction_list.
-    unordered_map<string, list<CacheNode>::iterator> cache_map;
+    // --- CLEANED ENGINE MEMORY ---
+    // Deleting list<CacheNode> entirely saves us 16 bytes per node in pointers!
+    // Now mapping string keys directly to CacheNode structures
+    unordered_map<string, CacheNode> cache_map;
 
     bool is_expired(const CacheNode& node) {
         if (!node.has_ttl) return false;
         return chrono::steady_clock::now() > node.expiry_time;
     }
 
-    // CRITICAL_SECTION is the native Windows equivalent of a mutex.
-    // It prevents multiple threads from executing code inside a block simultaneously.
     CRITICAL_SECTION shard_lock;
 
 public:
@@ -55,114 +61,112 @@ public:
         InitializeCriticalSection(&shard_lock);
     }
 
-    // Default constructor so arrays of shards can be allocated
     CacheShard() {
-        max_capacity = 10; // Fallback default capacity
+        max_capacity = 10; 
         InitializeCriticalSection(&shard_lock);
     }
 
-    // A setter so the master class can configure each shard's size
     void set_capacity(size_t capacity) {
         max_capacity = capacity;
     }
 
-    // Destructor: Clean up the lock from the OS memory when the cache is destroyed
     ~CacheShard() {
         DeleteCriticalSection(&shard_lock);
     }
 
     string get(const string& key) {
-
-        // EnterCriticalSection "locks" the door. 
-        // Other threads will pause here until this thread calls LeaveCriticalSection.
         EnterCriticalSection(&shard_lock);
 
-        // Check if the key exists in our hash map
         auto map_iterator = cache_map.find(key);
         
-        // (Cache Miss)
+        // Cache Miss
         if (map_iterator == cache_map.end()) {
-            LeaveCriticalSection(&shard_lock); // Unlock before returning!
+            LeaveCriticalSection(&shard_lock); 
             return "";
         }
 
-        // (Cache Hit)
-        // map_iterator->second holds the list iterator (pointer to the node)
-        auto list_iterator = map_iterator->second;
-
-        // --- PASSIVE EXPIRATION CHECK ---
-        if (is_expired(*list_iterator)) {
-            // Clean it out of memory immediately!
-            cache_map.erase(key);
-            eviction_list.erase(list_iterator);
-            
-            LeaveCriticalSection(&shard_lock); // Don't forget to unlock!
-            return ""; // Treat it as a cache miss
+        // Passive Expiration Check
+        if (is_expired(map_iterator->second)) {
+            cache_map.erase(map_iterator);
+            LeaveCriticalSection(&shard_lock); 
+            return ""; 
         }
-        // --------------------------------
         
-        // Extracting the data before we move things around
-        string value = list_iterator->value;
+        // --- HIGH VELOCITY CLOCK UPDATE ---
+        // Instead of heavy pointer re-linking via splice, we just overwrite a timestamp!
+        map_iterator->second.last_accessed = chrono::steady_clock::now();
 
-        // Moving the node to the front of the eviction_list (MRU position)
-        // splice() is an O(1) operation that shifts an existing node to a new position
-        eviction_list.splice(eviction_list.begin(), eviction_list, list_iterator);
-
-        LeaveCriticalSection(&shard_lock); // Unlock before returning!
+        string value = map_iterator->second.value;
+        LeaveCriticalSection(&shard_lock); 
         return value;
     }
 
     void set(const string& key, const string& value, int ttl_seconds = 0) {
-
         EnterCriticalSection(&shard_lock);
 
-        // Checking if the key already exists
         auto map_iterator = cache_map.find(key);
 
+        // Key already exists -> Update data and update timestamp
         if (map_iterator != cache_map.end()) {
-            auto list_iterator = map_iterator->second;
-            list_iterator->value = value; // Update the value
+            map_iterator->second.value = value;
+            map_iterator->second.last_accessed = chrono::steady_clock::now();
 
             if (ttl_seconds > 0) {
-                list_iterator->expiry_time = chrono::steady_clock::now() + chrono::seconds(ttl_seconds);
-                list_iterator->has_ttl = true;
+                map_iterator->second.expiry_time = chrono::steady_clock::now() + chrono::seconds(ttl_seconds);
+                map_iterator->second.has_ttl = true;
             } else {
-                list_iterator->has_ttl = false;
+                map_iterator->second.has_ttl = false;
             }
             
-            // Moved it to the front (MRU)
-            eviction_list.splice(eviction_list.begin(), eviction_list, list_iterator);
-            LeaveCriticalSection(&shard_lock); // Unlock
+            LeaveCriticalSection(&shard_lock); 
             return;
         }
 
-        // Key is new. First, handle eviction if cache is full.
+        // --- NEW REDIS-STYLE APPROXIMATE LRU EVICTION ---
         if (cache_map.size() >= max_capacity) {
-            // Get the least recently used element from the back of the list
-            auto lru_node = eviction_list.back();
+            // Redis default: sample N=5 keys at random and find the oldest one
+            const int SAMPLE_SIZE = 5;
+            string oldest_key = "";
+            chrono::steady_clock::time_point oldest_time = chrono::steady_clock::time_point::max();
 
-            cache_map.erase(lru_node.key);
-            
-            eviction_list.pop_back();
+            auto it = cache_map.begin();
+            for (int i = 0; i < SAMPLE_SIZE && it != cache_map.end(); ++i) {
+                // Advance the map iterator by a pseudo-random index hop
+                int hop = rand() % (cache_map.size() / SAMPLE_SIZE + 1);
+                for (int h = 0; h < hop && it != cache_map.end(); ++h) {
+                    ++it;
+                }
+                
+                if (it == cache_map.end()) break;
+
+                // Compare timestamps to track the least recently used candidate
+                if (it->second.last_accessed < oldest_time) {
+                    oldest_time = it->second.last_accessed;
+                    oldest_key = it->first;
+                }
+                ++it;
+            }
+
+            // Evict the winner from memory
+            if (!oldest_key.empty()) {
+                cache_map.erase(oldest_key);
+            }
         }
 
-        //Inserted the new item at the front of the list
-        eviction_list.push_front(CacheNode(key, value, ttl_seconds));
-        
-        // Mapped the key to the newly inserted front node
-        cache_map[key] = eviction_list.begin();
+        // Insert new item directly into hash map
+        cache_map[key] = CacheNode(key, value, ttl_seconds);
 
-        LeaveCriticalSection(&shard_lock); // Unlock
+        LeaveCriticalSection(&shard_lock); 
     }
 
+    // Background thread cleanup pass
     void clean_expired_keys() {
         EnterCriticalSection(&shard_lock);
         
-        auto it = eviction_list.begin();
-        while (it != eviction_list.end()) {
-            if (is_expired(*it)) {
-                cache_map.erase(it->key);
-                it = eviction_list.erase(it); // erase returns the next valid iterator
+        auto it = cache_map.begin();
+        while (it != cache_map.end()) {
+            if (is_expired(it->second)) {
+                it = cache_map.erase(it); // Returns the next valid iterator
                 cout << "[Background Shard Worker] Evicted expired key from memory." << endl;
             } else {
                 ++it;
