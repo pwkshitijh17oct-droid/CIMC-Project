@@ -1,4 +1,4 @@
-# High-Performance Sharded In-Memory Cache Engine
+# High-Performance Concurrent In-Memory Cache Engine
 
 A custom-built, multi-threaded, sharded in-memory key-value cache engine written in C++17. Designed to handle intense concurrent workloads using Win32 network threading sockets, data durability via Write-Ahead Logging (WAL), and optimized memory-efficient eviction using a Redis-style Approximate LRU algorithm.
 
